@@ -402,7 +402,7 @@
 <body>
   <header>
     <h1>本地文件差异对比工具</h1>
-    <span class="pill">Static HTML V1.0 · 浏览器本地处理</span>
+        <span class="pill">Static HTML V1.0.5 · 导入下载校验</span>
   </header>
 
   <main>
@@ -476,6 +476,9 @@
           <div class="stat">差异量<strong id="diffCount">0</strong></div>
           <div class="stat">当前显示<strong id="shownCount">0</strong></div>
           <div class="stat">耗时<strong id="elapsedTime">0s</strong></div>
+          <div class="stat">解析模式<strong id="parserMode">-</strong></div>
+          <div class="stat">旧提取<strong id="leftUnitCount">0</strong></div>
+          <div class="stat">新提取<strong id="rightUnitCount">0</strong></div>
         </div>
 
         <div class="split">
@@ -551,7 +554,7 @@
   </main>
 
   <script>
-    const VERSION = "Static HTML V1.0";
+    const VERSION = "Static HTML V1.0.5 import-download-check";
     const PREVIEW_LIMIT = 5000;
     const SOURCE_HEADER_ALIASES = new Set([
       "中文", "原文", "原文中文", "源文", "源语言", "简中", "简体中文", "繁中", "繁体中文",
@@ -567,7 +570,8 @@
       fileType: "",
       leftName: "",
       rightName: "",
-      selectedIndex: -1
+      selectedIndex: -1,
+      parserModes: []
     };
 
     function $(id) {
@@ -696,7 +700,16 @@
     }
 
     function looksLikeLocatorValue(text) {
-      return /^ID=\(\d+\)$/i.test(text) || /^Line_\d+$/i.test(text);
+      const value = normalize(text);
+      if (!value) return false;
+      if (value.startsWith("\\|")) return true;
+      if (/^ID=\(\d+\)$/i.test(value) || /^Line_\d+$/i.test(value)) return true;
+      const lowered = value.toLowerCase();
+      if (lowered.startsWith("data/localdata[")) return true;
+      if (value.includes("/") || value.includes("\\")) {
+        return [".txt", ".xml", ".xlsx", ".csv", ".json", ".bytes", ".lua"].some((suffix) => lowered.endsWith(suffix));
+      }
+      return false;
     }
 
     function looksLikeKeyField(identity) {
@@ -792,10 +805,13 @@
 
     function parseSheetRows(sheetName, rows, options, fileType) {
       const units = [];
-      const explicitSourceColumns = options.excelSourceColumns;
-      const sourceColumns = explicitSourceColumns.length ? explicitSourceColumns : inferSourceColumns(rows);
-      const columnIdentities = buildColumnIdentities(rows);
-      const rowKeys = buildRowKeys(rows, options.excelKeyColumns, options.trimText);
+      const isSpreadsheetXml = fileType === "xml_spreadsheet";
+      const explicitSourceColumns = isSpreadsheetXml ? [] : options.excelSourceColumns;
+      const sourceColumns = isSpreadsheetXml
+        ? []
+        : (explicitSourceColumns.length ? explicitSourceColumns : inferSourceColumns(rows));
+      const columnIdentities = isSpreadsheetXml ? {} : buildColumnIdentities(rows);
+      const rowKeys = isSpreadsheetXml ? {} : buildRowKeys(rows, options.excelKeyColumns, options.trimText);
       const { rowSources, rowSourceColumns } = buildRowSources(
         rows,
         sourceColumns,
@@ -837,8 +853,8 @@
           }
 
           units.push({
-            file_type: fileType,
-            unit_type: "cell",
+            file_type: isSpreadsheetXml ? "xml" : fileType,
+            unit_type: isSpreadsheetXml ? "spreadsheet_cell" : "cell",
             locator: coordinate,
             match_key: matchKey,
             display_text: text,
@@ -854,7 +870,9 @@
               source_chinese: source,
               source_match_key: sourceKey,
               comparison_basis: comparisonBasis,
-              original_locator: coordinate
+              original_locator: coordinate,
+              locator_mode: isSpreadsheetXml ? "spreadsheetml_cell" : "",
+              xml_table_format: isSpreadsheetXml ? "spreadsheetml" : ""
             }
           });
         }
@@ -865,6 +883,7 @@
     async function parseXlsxFile(file, options) {
       requireXlsx();
       log(`读取 Excel：${file.name}`);
+      state.parserModes.push("xlsx");
       const buffer = await readArrayBuffer(file);
       const workbook = XLSX.read(buffer, { type: "array", cellFormula: true, cellDates: false });
       const units = [];
@@ -967,6 +986,12 @@
     function isSpreadsheetXml(doc) {
       if (localName(doc.documentElement) === "Workbook") return true;
       return elementsByLocalName(doc, "Worksheet").length > 0 && elementsByLocalName(doc, "Data").length > 0;
+    }
+
+    function looksLikeSpreadsheetXmlText(text) {
+      const head = String(text || "").slice(0, 200000);
+      return /<Workbook[\s>]/i.test(head)
+        && (/schemas-microsoft-com:office:spreadsheet/i.test(head) || /<Worksheet[\s>]/i.test(head));
     }
 
     function getAttrByLocalName(element, name) {
@@ -1072,18 +1097,25 @@
     async function parseXmlFile(file, options) {
       log(`读取 XML：${file.name}`);
       const text = await readText(file);
+      const spreadsheetHint = looksLikeSpreadsheetXmlText(text);
       const doc = parseXmlString(text);
-      if (isSpreadsheetXml(doc)) {
+      if (spreadsheetHint || isSpreadsheetXml(doc)) {
         const units = parseSpreadsheetXml(doc, options);
+        if (!units.length) {
+          throw new Error("已识别为 Excel XML 表格，但没有提取到可对比译文列。请确认文件不是损坏的 XML。");
+        }
+        state.parserModes.push("xml_spreadsheet");
         log(`XML 表格提取完成：${units.length} 条`);
         return units;
       }
       const localization = parseLocalizationXml(doc, options);
       if (localization.length) {
+        state.parserModes.push("xml_localization");
         log(`XML 本地化文本提取完成：${localization.length} 条`);
         return localization;
       }
       const generic = parseGenericXml(doc, options);
+      state.parserModes.push("xml_generic");
       log(`XML 通用节点提取完成：${generic.length} 条`);
       return generic;
     }
@@ -1091,6 +1123,7 @@
     async function parseDocxFile(file, options) {
       requireZip();
       log(`读取 Word：${file.name}`);
+      state.parserModes.push("docx");
       const zip = await JSZip.loadAsync(await readArrayBuffer(file));
       const docXml = await zip.file("word/document.xml")?.async("text");
       if (!docXml) throw new Error("DOCX 中没有找到 word/document.xml");
@@ -1218,6 +1251,10 @@
         $("compareBtn").disabled = true;
         $("exportBtn").disabled = true;
         state.rows = [];
+        state.parserModes = [];
+        $("parserMode").textContent = "-";
+        $("leftUnitCount").textContent = "0";
+        $("rightUnitCount").textContent = "0";
         renderRows([]);
         renderDetail(null);
         const start = performance.now();
@@ -1237,6 +1274,9 @@
         await nextFrame();
         const rightUnits = await parseFile(right, rightType, options);
         await nextFrame();
+        $("leftUnitCount").textContent = String(leftUnits.length);
+        $("rightUnitCount").textContent = String(rightUnits.length);
+        $("parserMode").textContent = Array.from(new Set(state.parserModes)).join(" / ") || leftType;
         log(`开始配对：旧 ${leftUnits.length} 条，新 ${rightUnits.length} 条`);
         const rows = compareUnitLists(leftUnits, rightUnits);
         state.rows = rows;
@@ -1399,7 +1439,8 @@
       document.body.appendChild(a);
       a.click();
       a.remove();
-      URL.revokeObjectURL(url);
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      return filename;
     }
 
     function collectXmlPatchTargets(doc) {
@@ -1454,6 +1495,10 @@
     async function importIntoXml(diffRows, targetFile) {
       const text = await readText(targetFile);
       const doc = parseXmlString(text);
+      if (looksLikeSpreadsheetXmlText(text) || isSpreadsheetXml(doc)) {
+        log("目标 XML 已识别为 SpreadsheetML 表格，按单元格定位导入。");
+        return importIntoSpreadsheetXml(diffRows, targetFile, doc);
+      }
       const targets = collectXmlPatchTargets(doc);
       let applied = 0;
       let skipped = 0;
@@ -1481,8 +1526,10 @@
       }
       const output = new XMLSerializer().serializeToString(doc);
       const base = targetFile.name.replace(/\.[^.]+$/, "");
-      downloadText(`${base}_imported.xml`, output, "application/xml;charset=utf-8");
-      exportImportReport(report, targetFile.name);
+      const outputName = `${base}_imported.xml`;
+      downloadText(outputName, output, "application/xml;charset=utf-8");
+      log(`XML 导入已生成下载文件：${outputName}。浏览器版不会覆盖原目标文件。`);
+      setTimeout(() => exportImportReport(report, targetFile.name), 800);
       return { total: diffRows.length, applied, skipped, failed };
     }
 
@@ -1490,6 +1537,202 @@
       const match = String(locator || "").match(/^(.+)!(\$?[A-Z]+\$?\d+)$/i);
       if (!match) return null;
       return { sheet: match[1], cell: match[2].replace(/\$/g, "").toUpperCase() };
+    }
+
+    function normalizeSpreadsheetLocator(locator) {
+      const parsed = parseLocatorCell(locator);
+      if (!parsed) return "";
+      return `${parsed.sheet.toLowerCase()}!${parsed.cell.toUpperCase()}`;
+    }
+
+    function patchRepeatOrdinal(patch) {
+      const value = Number(patch["重复序号"] || 1);
+      return Number.isFinite(value) && value > 0 ? value : 1;
+    }
+
+    function patchSourceChinese(patch) {
+      return normalize(patch["新内容对应原文中文"] || patch["旧内容对应原文中文"]);
+    }
+
+    function patchMatchKey(patch) {
+      return normalize(patch["匹配键"]).replace(/#\d+$/, "");
+    }
+
+    function fieldIdentityFromPatch(patch) {
+      const matchKey = patchMatchKey(patch);
+      const keyMatch = matchKey.match(/\|field:([^|]+)$/);
+      if (keyMatch) return keyMatch[1];
+      const locator = normalize(patch["新文件原始定位"] || patch["旧文件原始定位"]);
+      const parsed = parseLocatorCell(locator);
+      const column = parsed?.cell?.match(/^[A-Z]+/)?.[0] || "";
+      return column ? `col:${column}` : "";
+    }
+
+    function collectSpreadsheetXmlPatchTargets(doc, options) {
+      const targets = [];
+      const byLocator = new Map();
+      const byMatchKey = new Map();
+      const worksheets = elementsByLocalName(doc, "Worksheet");
+
+      worksheets.forEach((sheetEl, index) => {
+        const sheetName = getAttrByLocalName(sheetEl, "Name") || `Sheet${index + 1}`;
+        let rowNumber = 0;
+        const rows = Array.from(sheetEl.getElementsByTagName("*")).filter((el) => localName(el) === "Row");
+
+        for (const rowEl of rows) {
+          const rowIndex = Number(getAttrByLocalName(rowEl, "Index"));
+          rowNumber = rowIndex || rowNumber + 1;
+          const rowValues = [];
+          const cellRefs = {};
+          let colNumber = 0;
+          const cells = Array.from(rowEl.children).filter((el) => localName(el) === "Cell");
+
+          for (const cellEl of cells) {
+            const colIndex = Number(getAttrByLocalName(cellEl, "Index"));
+            colNumber = colIndex || colNumber + 1;
+            const dataEl = Array.from(cellEl.children).find((el) => localName(el) === "Data");
+            rowValues[colNumber] = dataEl ? normalize(dataEl.textContent, options.trimText) : "";
+            cellRefs[colNumber] = { cellEl, dataEl };
+          }
+
+          let source = "";
+          let sourceColumn = 0;
+          for (let c = 1; c < rowValues.length; c += 1) {
+            const value = normalize(rowValues[c], options.trimText);
+            if (value && hasCjk(value) && !looksLikeLocatorValue(value)) {
+              source = value;
+              sourceColumn = c;
+              break;
+            }
+          }
+          if (!sourceColumn) continue;
+
+          for (let c = 1; c < rowValues.length; c += 1) {
+            const text = normalize(rowValues[c], options.trimText);
+            if (!text || c === sourceColumn || c < sourceColumn || looksLikeLocatorValue(text)) continue;
+            const column = numberToColumnName(c);
+            const fieldIdentity = `col:${column}`;
+            const locator = `${sheetName}!${column}${rowNumber}`;
+            const matchKey = sourceMatchKey("xml_spreadsheet", source, fieldIdentity);
+            const ref = cellRefs[c] || {};
+            const target = {
+              sheet: sheetName,
+              row: rowNumber,
+              column,
+              cell: `${column}${rowNumber}`,
+              locator,
+              match_key: matchKey,
+              source,
+              text,
+              cellEl: ref.cellEl,
+              dataEl: ref.dataEl
+            };
+            targets.push(target);
+            byLocator.set(normalizeSpreadsheetLocator(locator), target);
+            if (!byMatchKey.has(matchKey)) byMatchKey.set(matchKey, []);
+            byMatchKey.get(matchKey).push(target);
+          }
+        }
+      });
+
+      return { targets, byLocator, byMatchKey };
+    }
+
+    function findSpreadsheetXmlPatchTarget(index, patch) {
+      const locators = [patch["新文件原始定位"], patch["旧文件原始定位"]].map(normalize).filter(Boolean);
+      for (const locator of locators) {
+        const found = index.byLocator.get(normalizeSpreadsheetLocator(locator));
+        if (found) return { target: found, source: "locator" };
+      }
+
+      const repeat = patchRepeatOrdinal(patch);
+      const matchKey = patchMatchKey(patch);
+      if (matchKey) {
+        const matches = index.byMatchKey.get(matchKey) || [];
+        const found = matches[repeat - 1] || matches[0];
+        if (found) return { target: found, source: "match_key" };
+      }
+
+      const source = patchSourceChinese(patch);
+      const fieldIdentity = fieldIdentityFromPatch(patch);
+      if (source && fieldIdentity) {
+        const matches = index.byMatchKey.get(sourceMatchKey("xml_spreadsheet", source, fieldIdentity)) || [];
+        const found = matches[repeat - 1] || matches[0];
+        if (found) return { target: found, source: "source_chinese" };
+      }
+
+      if (source) {
+        const matches = index.targets.filter((target) => target.source === source);
+        const found = matches[repeat - 1] || matches[0];
+        if (found) return { target: found, source: "source_chinese_any_column" };
+      }
+      return { target: null, source: "" };
+    }
+
+    function setSpreadsheetXmlCellText(doc, target, value) {
+      let dataEl = target.dataEl;
+      if (!dataEl) {
+        if (!target.cellEl) throw new Error("目标单元格缺少 Data 节点");
+        const ns = target.cellEl.namespaceURI || doc.documentElement.namespaceURI || null;
+        dataEl = ns ? doc.createElementNS(ns, "Data") : doc.createElement("Data");
+        dataEl.setAttribute("ss:Type", "String");
+        target.cellEl.appendChild(dataEl);
+        target.dataEl = dataEl;
+      }
+      dataEl.textContent = String(value ?? "");
+      target.text = dataEl.textContent;
+    }
+
+    async function importIntoSpreadsheetXml(diffRows, targetFile, doc) {
+      const options = getOptions();
+      const index = collectSpreadsheetXmlPatchTargets(doc, options);
+      let applied = 0;
+      let skipped = 0;
+      let failed = 0;
+      const report = [["状态", "定位来源", "单元格", "原文中文", "覆盖前值", "写入值", "问题"]];
+
+      for (const patch of diffRows) {
+        if (normalize(patch["状态"]) !== "modified") {
+          skipped += 1;
+          report.push(["skipped", "", "", patchSourceChinese(patch), "", "", "非 modified"]);
+          continue;
+        }
+
+        const newValue = String(patch["新文件内容"] ?? "");
+        const found = findSpreadsheetXmlPatchTarget(index, patch);
+        if (!found.target) {
+          failed += 1;
+          report.push(["failed", "", "", patchSourceChinese(patch), "", newValue, "定位失败"]);
+          continue;
+        }
+
+        const before = found.target.dataEl ? found.target.dataEl.textContent : "";
+        try {
+          setSpreadsheetXmlCellText(doc, found.target, newValue);
+          applied += 1;
+          report.push([
+            "applied",
+            found.source,
+            found.target.locator,
+            found.target.source,
+            before,
+            newValue,
+            before === patch["旧文件内容"] ? "" : "覆盖前不一致"
+          ]);
+        } catch (error) {
+          failed += 1;
+          report.push(["failed", found.source, found.target.locator, found.target.source, before, newValue, error.message || String(error)]);
+        }
+      }
+
+      const output = new XMLSerializer().serializeToString(doc);
+      const base = targetFile.name.replace(/\.[^.]+$/, "");
+      const outputName = `${base}_imported.xml`;
+      log(`XML 表格导入写入 ${applied} 个单元格，失败 ${failed} 条；准备下载：${outputName}`);
+      downloadText(outputName, output, "application/xml;charset=utf-8");
+      log(`请打开浏览器下载的新文件 ${outputName} 检查结果，原目标 XML 不会被覆盖。`);
+      setTimeout(() => exportImportReport(report, targetFile.name), 800);
+      return { total: diffRows.length, applied, skipped, failed };
     }
 
     function findWorkbookPatchUnit(units, patch) {
@@ -1575,6 +1818,12 @@
         requireXlsx();
         const targetType = detectType(targetFile, $("targetFormat").value);
         if (!["xlsx", "xml"].includes(targetType)) throw new Error("差异导入只支持 xlsx / xml。");
+        const targetSuffix = (targetFile.name || "").split(".").pop().toLowerCase();
+        const explicitTargetType = $("targetFormat").value;
+        if (explicitTargetType !== "auto" && ["xlsx", "xml"].includes(targetSuffix) && targetType !== targetSuffix) {
+          throw new Error(`目标文件扩展名是 .${targetSuffix}，但目标格式选择了 ${targetType}。请改为 auto 或 ${targetSuffix} 后重试。`);
+        }
+        log(`目标格式识别：${targetType}。浏览器版会下载导入后的新文件，不会覆盖原目标文件。`);
         log(`读取差异表：${diffFile.name}`);
         const diffWorkbook = XLSX.read(await readArrayBuffer(diffFile), { type: "array", cellDates: false });
         const diffRows = readDiffWorkbookRows(diffWorkbook);
