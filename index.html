@@ -402,7 +402,7 @@
 <body>
   <header>
     <h1>本地文件差异对比工具</h1>
-        <span class="pill">Static HTML V1.0.5 · 导入下载校验</span>
+        <span class="pill">Static HTML V1.0.6 · 空格保留</span>
   </header>
 
   <main>
@@ -554,7 +554,7 @@
   </main>
 
   <script>
-    const VERSION = "Static HTML V1.0.5 import-download-check";
+    const VERSION = "Static HTML V1.0.6 whitespace-preserve";
     const PREVIEW_LIMIT = 5000;
     const SOURCE_HEADER_ALIASES = new Set([
       "中文", "原文", "原文中文", "源文", "源语言", "简中", "简体中文", "繁中", "繁体中文",
@@ -609,6 +609,10 @@
       if (value === null || value === undefined) return "";
       const text = String(value);
       return trim ? text.trim() : text;
+    }
+
+    function rawValue(value) {
+      return normalize(value, false);
     }
 
     function hasCjk(value) {
@@ -783,18 +787,23 @@
         const row = rows[r] || [];
         if (sourceColumns.length) {
           if (!explicitColumns && r === 1) continue;
-          const parts = sourceColumns.map((c) => normalize(row[c], trimText)).filter(Boolean);
+          const parts = sourceColumns
+            .map((c) => ({ raw: rawValue(row[c]), normalized: normalize(row[c], trimText) }))
+            .filter((item) => item.normalized)
+            .map((item) => item.raw);
           const source = parts.join(" / ");
-          if (source && (explicitColumns || hasCjk(source))) {
+          const normalizedSource = normalize(source, trimText);
+          if (normalizedSource && (explicitColumns || hasCjk(normalizedSource))) {
             rowSources[r] = source;
             rowSourceColumns[r] = sourceColumns[0];
           }
           continue;
         }
         for (let c = 1; c < row.length; c += 1) {
-          const text = normalize(row[c], trimText);
-          if (text && hasCjk(text)) {
-            rowSources[r] = text;
+          const raw = rawValue(row[c]);
+          const normalized = normalize(row[c], trimText);
+          if (normalized && hasCjk(normalized)) {
+            rowSources[r] = raw;
             rowSourceColumns[r] = c;
             break;
           }
@@ -824,11 +833,13 @@
       for (let r = 1; r < rows.length; r += 1) {
         const row = rows[r] || [];
         for (let c = 1; c < row.length; c += 1) {
-          const text = normalize(row[c], options.trimText);
-          if (!text || looksLikeLocatorValue(text)) continue;
+          const text = rawValue(row[c]);
+          const normalizedText = normalize(row[c], options.trimText);
+          if (text === "" || looksLikeLocatorValue(normalizedText)) continue;
           if (sourceColumns.length && !explicitSourceColumns.length && r === 1) continue;
           const source = rowSources[r] || "";
           if (sourceBasedSheet && !source) continue;
+          const sourceForMatch = normalize(source, options.trimText);
 
           const columnLetter = numberToColumnName(c);
           const coordinate = `${sheetName}!${columnLetter}${r}`;
@@ -838,7 +849,7 @@
           const rowSourceColumn = rowSourceColumns[r];
           const fieldIdentity = columnIdentities[c] || `col:${columnLetter}`;
 
-          if (source) {
+          if (sourceForMatch) {
             if (
               sourceColumnSet.has(c) ||
               c === rowSourceColumn ||
@@ -847,9 +858,9 @@
             ) {
               continue;
             }
-            matchKey = sourceMatchKey(fileType, source, fieldIdentity);
+            matchKey = sourceMatchKey(fileType, sourceForMatch, fieldIdentity);
             comparisonBasis = "source_chinese";
-            sourceKey = source;
+            sourceKey = sourceForMatch;
           }
 
           units.push({
@@ -950,15 +961,16 @@
         const original = getAttrCI(element, "OriginalText");
         if (!translation && !original) continue;
         ordinal += 1;
-        const source = normalize(original, options.trimText);
-        const display = normalize(translation, options.trimText);
-        if (!display && !source) continue;
-        const identityInfo = extractIdentity(source, display, getAttrCI(element, "Name"), ordinal);
+        const source = rawValue(original);
+        const display = rawValue(translation);
+        const sourceForMatch = normalize(source, options.trimText);
+        if (display === "" && source === "") continue;
+        const identityInfo = extractIdentity(sourceForMatch, display, getAttrCI(element, "Name"), ordinal);
         const locator = identityInfo.mode === "text_ordinal"
           ? `text_ordinal:${ordinal}/@TranslationText`
           : `${identityInfo.identity}/@TranslationText`;
-        const matchKey = source
-          ? sourceMatchKey("xml", source, "TranslationText")
+        const matchKey = sourceForMatch
+          ? sourceMatchKey("xml", sourceForMatch, "TranslationText")
           : `xml|${identityInfo.mode}:${identityInfo.identity}|field:TranslationText`;
         units.push({
           file_type: "xml",
@@ -969,8 +981,8 @@
           source_chinese: source,
           context: `text_ordinal=${ordinal}; identity=${identityInfo.identity}`,
           metadata: {
-            comparison_basis: source ? "source_chinese" : "fallback",
-            source_match_key: source,
+            comparison_basis: sourceForMatch ? "source_chinese" : "fallback",
+            source_match_key: sourceForMatch,
             field_identity: "TranslationText",
             original_locator: locator,
             locator_mode: identityInfo.mode,
@@ -1018,7 +1030,7 @@
             const colIndex = Number(getAttrByLocalName(cellEl, "Index"));
             colNumber = colIndex || colNumber + 1;
             const dataEl = Array.from(cellEl.children).find((el) => localName(el) === "Data");
-            row[colNumber] = dataEl ? normalize(dataEl.textContent, options.trimText) : "";
+            row[colNumber] = dataEl ? rawValue(dataEl.textContent) : "";
           }
           rows[rowNumber] = row;
         }
@@ -1052,15 +1064,16 @@
         const stable = keys.map((k) => getAttrCI(element, k)).find(Boolean);
         const baseKey = stable ? `${localName(element)}|key:${stable}` : path;
         for (const attr of Array.from(element.attributes || [])) {
-          const value = normalize(attr.value, options.trimText);
-          if (!value) continue;
+          const value = rawValue(attr.value);
+          const normalizedValue = normalize(attr.value, options.trimText);
+          if (value === "") continue;
           units.push({
             file_type: "xml",
             unit_type: "attribute",
             locator: `${path}/@${attr.name}`,
             match_key: `${baseKey}|@${attr.name}`,
             display_text: value,
-            source_chinese: hasCjk(value) ? value : "",
+            source_chinese: hasCjk(normalizedValue) ? value : "",
             context: localName(element),
             metadata: {
               comparison_basis: stable ? "key_attribute" : "path",
@@ -1073,15 +1086,16 @@
           .filter((node) => node.nodeType === 3)
           .map((node) => node.nodeValue)
           .join("");
-        const textValue = normalize(directText, options.trimText);
-        if (textValue) {
+        const textValue = rawValue(directText);
+        const normalizedTextValue = normalize(directText, options.trimText);
+        if (textValue && (normalizedTextValue || element.children.length === 0)) {
           units.push({
             file_type: "xml",
             unit_type: "text",
             locator: path,
             match_key: `${baseKey}|text`,
             display_text: textValue,
-            source_chinese: hasCjk(textValue) ? textValue : "",
+            source_chinese: hasCjk(normalizedTextValue) ? textValue : "",
             context: localName(element),
             metadata: {
               comparison_basis: stable ? "key_attribute" : "path",
@@ -1136,10 +1150,11 @@
           .filter((el) => localName(el) === "t")
           .map((el) => el.textContent || "")
           .join("");
-        const value = normalize(text, options.trimText);
-        if (!value) return;
-        const source = hasCjk(value) ? value : previousChinese;
-        if (hasCjk(value)) previousChinese = value;
+        const value = rawValue(text);
+        const normalizedValue = normalize(text, options.trimText);
+        if (value === "") return;
+        const source = hasCjk(normalizedValue) ? value : previousChinese;
+        if (hasCjk(normalizedValue)) previousChinese = value;
         units.push({
           file_type: "docx",
           unit_type: "paragraph",
@@ -1591,7 +1606,7 @@
             const colIndex = Number(getAttrByLocalName(cellEl, "Index"));
             colNumber = colIndex || colNumber + 1;
             const dataEl = Array.from(cellEl.children).find((el) => localName(el) === "Data");
-            rowValues[colNumber] = dataEl ? normalize(dataEl.textContent, options.trimText) : "";
+            rowValues[colNumber] = dataEl ? rawValue(dataEl.textContent) : "";
             cellRefs[colNumber] = { cellEl, dataEl };
           }
 
@@ -1600,7 +1615,7 @@
           for (let c = 1; c < rowValues.length; c += 1) {
             const value = normalize(rowValues[c], options.trimText);
             if (value && hasCjk(value) && !looksLikeLocatorValue(value)) {
-              source = value;
+              source = rawValue(rowValues[c]);
               sourceColumn = c;
               break;
             }
@@ -1608,12 +1623,13 @@
           if (!sourceColumn) continue;
 
           for (let c = 1; c < rowValues.length; c += 1) {
-            const text = normalize(rowValues[c], options.trimText);
-            if (!text || c === sourceColumn || c < sourceColumn || looksLikeLocatorValue(text)) continue;
+            const text = rawValue(rowValues[c]);
+            const normalizedText = normalize(rowValues[c], options.trimText);
+            if (text === "" || c === sourceColumn || c < sourceColumn || looksLikeLocatorValue(normalizedText)) continue;
             const column = numberToColumnName(c);
             const fieldIdentity = `col:${column}`;
             const locator = `${sheetName}!${column}${rowNumber}`;
-            const matchKey = sourceMatchKey("xml_spreadsheet", source, fieldIdentity);
+            const matchKey = sourceMatchKey("xml_spreadsheet", normalize(source, options.trimText), fieldIdentity);
             const ref = cellRefs[c] || {};
             const target = {
               sheet: sheetName,
